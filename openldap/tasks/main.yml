@@ -1,0 +1,197 @@
+---
+# file: roles/ldap/tasks/main.yml
+
+- name: Install OpenLDAP packages
+  yum:
+    name:
+      - openldap
+      - openldap-servers
+      - openldap-clients
+      - libsemanage-python
+    state: present
+
+- name: Install EPEL
+  yum:
+    name: epel-release
+    state: present
+  when: install_phpldapadmin|bool
+
+- name: Install phpldapadmin
+  yum:
+    name: phpldapadmin
+    state: present
+  when: install_phpldapadmin|bool
+
+- name: Install Ansible ldap-module dependency
+  yum:
+    name: python-ldap
+    state: installed
+
+- name: Start ldap service
+  service:
+    name: slapd
+    state: started
+    enabled: yes
+
+- name: enable the LDAP ports on the firewall
+  firewalld:
+    service: "{{ item }}"
+    permanent: true
+    state: enabled
+    zone: public
+  with_items:
+  - ldap
+  - ldaps
+  notify:
+  - restart firewalld
+
+- name: Check RootDN password
+  command: "ldapwhoami -h localhost -D {{ root_rdn }},{{ ds_base_suffix }} -x -w {{ openldap_admin_password }}"
+  register: pwcheck
+  changed_when: pwcheck.rc != 0
+  ignore_errors: yes
+
+- name: Creating RootDN SSHA HASH
+  shell: slappasswd -s {{ openldap_admin_password }}
+  register: admin_password
+  when: pwcheck.rc !=0
+
+- name: Set the BASE suffix
+  ldap_attr:
+    dn: olcDatabase={2}hdb,cn=config
+    name: olcSuffix
+    values: "{{ ds_base_suffix }}"
+    state: exact
+
+- name: Set the root DN
+  ldap_attr:
+    dn: olcDatabase={2}hdb,cn=config
+    name: olcRootDN
+    values: "{{ root_rdn }},{{ ds_base_suffix }}"
+    state: exact
+
+- name: Set the root DN password
+  ldap_attr:
+    dn: olcDatabase={2}hdb,cn=config
+    name: olcRootPW
+    values: "{{ admin_password.stdout }}"
+    state: exact
+  when: pwcheck.rc !=0
+
+- name: Allow External authentication write access to tree
+  ldap_attr:
+    dn: olcDatabase={2}hdb,cn=config
+    name: olcAccess
+    values: '{0}to * by dn.base="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" manage by dn.base="{{ root_rdn }},{{ ds_base_suffix }}" read by * none'
+    state: exact
+
+- name: Allow access to monitor
+  ldap_attr:
+    dn: "olcDatabase={1}monitor,cn=config"
+    name: olcAccess
+    values: '{0}to * by dn.base="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" manage by dn.base="{{ root_rdn }},{{ ds_base_suffix }}" read by * none'
+    state: exact
+
+- name: Allow access to the configuration
+  ldap_attr:
+    dn: "olcDatabase={0}config,cn=config"
+    name: olcAccess
+    values: '{0}to * by dn.base="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" manage by dn.base="{{ root_rdn }},{{ ds_base_suffix }}" read by * none'
+    state: exact
+
+- name: Copy the ssh key schema
+  copy:
+    src: "{{ item }}"
+    dest: /root/
+  with_items:
+  - openssh-lpk-openldap.schema
+  - openssh-lpk-openldap.ldif
+
+- name: Add the core schema
+  command: ldapadd -c -Y EXTERNAL -H ldapi:/// -f /etc/openldap/schema/core.ldif
+  register: add_schema_core
+  changed_when: add_schema_core.rc == 0
+  failed_when: "add_schema_core.rc != 0 and 'Duplicate attributeType' not in add_schema_core.stderr"
+
+- name: Add the cosine schema
+  command: ldapadd -c -Y EXTERNAL -H ldapi:/// -f /etc/openldap/schema/cosine.ldif
+  register: add_schema_cosine
+  changed_when: add_schema_cosine.rc == 0
+  failed_when: "add_schema_cosine.rc != 0 and 'Duplicate attributeType' not in add_schema_cosine.stderr"
+
+- name: Add the inetorgperson schema
+  command: ldapadd -c -Y EXTERNAL -H ldapi:/// -f /etc/openldap/schema/inetorgperson.ldif
+  register: add_schema_inetorgperson
+  changed_when: add_schema_inetorgperson.rc == 0
+  failed_when: "add_schema_inetorgperson.rc != 0 and 'Duplicate attributeType' not in add_schema_inetorgperson.stderr"
+
+- name: Add the NIS schema
+  command: ldapadd -c -Y EXTERNAL -H ldapi:/// -f /etc/openldap/schema/nis.ldif
+  register: add_schema_nis
+  changed_when: add_schema_nis.rc == 0
+  failed_when: "add_schema_nis.rc != 0 and 'Duplicate attributeType' not in add_schema_nis.stderr"
+
+- name: Add the ssh key schema
+  command: ldapadd -c -Y EXTERNAL -H ldapi:/// -f /root/openssh-lpk-openldap.ldif
+  register: add_schema_sshkey
+  changed_when: add_schema_sshkey.rc == 0
+  failed_when: "add_schema_sshkey.rc != 0 and 'Duplicate attributeType' not in add_schema_sshkey.stderr"
+
+- name: Create the base database
+  ldap_entry:
+    dn: '{{ ds_base_suffix }}'
+    objectClass:
+      - dcObject
+      - organization
+    attributes:
+      o: Base Database
+      description: Base database
+    state: present
+
+- name: Copy Backup
+  copy:
+    src: "{{ backup_file_path }}"
+    dest: /root/restore.ldif
+  when: backup_file_path is defined
+
+- name: Restore Backup
+  command: ldapadd -c -Y EXTERNAL -H ldapi:/// -f /root/restore.ldif
+  when: backup_file_path is defined
+
+- name: Allow external access to phpLdapAdmin
+  replace: backup=yes dest=/etc/httpd/conf.d/phpldapadmin.conf
+           regexp="Require local"
+           replace="Require all granted"
+  notify:
+  - restart httpd
+  when: install_phpldapadmin|bool
+
+- name: Let SELinux allow httpd access to the network (including the LDAP server)
+  seboolean: name=httpd_can_network_connect state=yes persistent=yes
+  when: install_phpldapadmin|bool
+
+- name: Use DN for authentication
+  replace: backup=yes dest=/usr/share/phpldapadmin/config/config.php
+           regexp="^// \$servers->setValue\('login','attr','dn'\);"
+           replace="$servers->setValue('login','attr','dn');"
+  notify:
+  - restart httpd
+  when: install_phpldapadmin|bool
+
+- name: Disable UID for authentication
+  replace: backup=yes dest=/usr/share/phpldapadmin/config/config.php
+           regexp="^\$servers->setValue\('login','attr','uid'\);"
+           replace="// $servers->setValue('login','attr','uid');"
+  notify:
+  - restart httpd
+  when: install_phpldapadmin|bool
+
+- name: Open the firewall for http
+  firewalld: service=http permanent=true state=enabled zone=public
+  notify:
+  - restart firewalld
+  when: install_phpldapadmin|bool
+
+- name: Ensure httpd is started
+  service: name=httpd state=started enabled=yes
+  when: install_phpldapadmin|bool

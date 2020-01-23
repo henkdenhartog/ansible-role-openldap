@@ -1,0 +1,4 @@
+ds_base_suffix: "dc=subdomain,dc=example,dc=com"
+root_dn_cn: Manager
+install_phpldapadmin: false
+openldap_admin_password: 12345678

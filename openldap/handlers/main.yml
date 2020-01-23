@@ -1,0 +1,17 @@
+---
+# roles/bind/handlers/main.yml
+
+- name: restart firewalld
+  service:
+    name: firewalld
+    state: restarted
+
+- name: restart ldap
+  service:
+    name: slapd
+    state: restarted
+
+- name: restart httpd
+  service:
+    name: httpd
+    state: restarted
